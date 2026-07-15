@@ -28,6 +28,7 @@ CODER_USER="coder"
 CODER_CREDS="/home/$CODER_USER/.git-credentials"
 CALLING_USER="${SUDO_USER:-$USER}"
 SETUP_PAT=false
+ROOTED_DOCKER=false
 
 # Parse options
 while [[ $# -gt 0 ]]; do
@@ -36,9 +37,13 @@ while [[ $# -gt 0 ]]; do
             SETUP_PAT=true
             shift
             ;;
+        --rooted)
+            ROOTED_DOCKER=true
+            shift
+            ;;
         -*)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--pat] /path/to/project"
+            echo "Usage: $0 [--pat] [--rooted] /path/to/project"
             exit 1
             ;;
         *)
@@ -48,7 +53,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 [--pat] /path/to/project"
+    echo "Usage: $0 [--pat] [--rooted] /path/to/project"
     exit 1
 fi
 
@@ -61,10 +66,21 @@ fi
 
 # The isolation is pointless if coder can reach the rootful Docker daemon: the
 # 'docker' group is root-equivalent (docker run -v /:/host ... => host root).
-if id -nG "$CODER_USER" | grep -qw docker; then
+# --rooted bypasses this guard for projects that break under rootless Docker,
+# but containers can then escape to host root.
+if [[ "$ROOTED_DOCKER" == true ]]; then
+    echo "==> WARNING: --rooted mode — Docker containers run with host-root "
+    echo "    privileges. Isolation is significantly degraded."
+    if ! id -nG "$CODER_USER" | grep -qw docker; then
+        echo "==> WARNING: '$CODER_USER' is NOT in the 'docker' group."
+        echo "    Rooted Docker may not work. Run: sudo gpasswd -a $CODER_USER docker"
+        echo "    then log out and back in (or newgrp docker) for it to take effect."
+    fi
+elif id -nG "$CODER_USER" | grep -qw docker; then
     echo "Error: '$CODER_USER' is in the 'docker' group (root-equivalent), which"
     echo "       defeats isolation. Run: sudo gpasswd -d $CODER_USER docker"
     echo "       and set up rootless Docker instead (see SETUP block in this file)."
+    echo "       Or use --rooted if you explicitly need rootful Docker."
     exit 1
 fi
 
@@ -167,14 +183,17 @@ sudo -u "$CODER_USER" mkdir -p "$CODER_HOME/.vscode/extensions"
 
 # Ensure coder's rootless Docker daemon is running, and point the sandbox at it
 # (its own unprivileged socket) rather than the host's root-owned socket.
-CODER_DOCKER_SOCK="$CODER_RUNTIME/docker.sock"
-sudo -u "$CODER_USER" \
-    XDG_RUNTIME_DIR="$CODER_RUNTIME" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=$CODER_RUNTIME/bus" \
-    systemctl --user start docker 2>/dev/null || true
-if [[ ! -S "$CODER_DOCKER_SOCK" ]]; then
-    echo "Warning: rootless Docker socket not found at $CODER_DOCKER_SOCK"
-    echo "         Has 'dockerd-rootless-setuptool.sh install' been run? (see SETUP block)"
+# Skip when --rooted: coder will use the host's rootful Docker daemon instead.
+if [[ "$ROOTED_DOCKER" == false ]]; then
+    CODER_DOCKER_SOCK="$CODER_RUNTIME/docker.sock"
+    sudo -u "$CODER_USER" \
+        XDG_RUNTIME_DIR="$CODER_RUNTIME" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$CODER_RUNTIME/bus" \
+        systemctl --user start docker 2>/dev/null || true
+    if [[ ! -S "$CODER_DOCKER_SOCK" ]]; then
+        echo "Warning: rootless Docker socket not found at $CODER_DOCKER_SOCK"
+        echo "         Has 'dockerd-rootless-setuptool.sh install' been run? (see SETUP block)"
+    fi
 fi
 
 # Capture coder's login PATH so tools like Flutter are available
@@ -187,11 +206,19 @@ fi
 
 # Launch VS Code as coder
 echo "==> Launching VS Code as $CODER_USER on $PROJECT_DIR ..."
+
+# Build the DOCKER_HOST assignment: rootless points at coder's own socket;
+# rooted omits it so Docker falls back to /var/run/docker.sock.
+DOCKER_HOST_ENV=()
+if [[ "$ROOTED_DOCKER" == false ]]; then
+    DOCKER_HOST_ENV=("DOCKER_HOST=unix://$CODER_DOCKER_SOCK")
+fi
+
 sudo -u "$CODER_USER" \
     PATH="$CODER_PATH" \
     DISPLAY="$DISPLAY" \
     WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
     XDG_RUNTIME_DIR="$CODER_RUNTIME" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=$CODER_RUNTIME/bus" \
-    DOCKER_HOST="unix://$CODER_DOCKER_SOCK" \
+    "${DOCKER_HOST_ENV[@]}" \
     code --no-sandbox --password-store="basic" "$PROJECT_DIR"

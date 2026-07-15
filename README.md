@@ -71,7 +71,12 @@ The wrapper then sets `DOCKER_HOST` inside VS Code to `coder`'s rootless socket,
 
 # Also configure a GitHub PAT for the project's origin remote
 ./vscode-isolate.sh --pat /path/to/project
+
+# Use rootful (host) Docker instead of rootless (opt-in escape hatch)
+./vscode-isolate.sh --rooted /path/to/project
 ```
+
+**`--rooted`**: Skips rootless Docker enforcement and lets `coder` use the host's rootful Docker daemon (`/var/run/docker.sock`). Use this when a project breaks under rootless Docker (e.g., needs privileged containers, certain volume mounts, or host networking). **Trade-off**: containers can escape to host root — isolation is significantly degraded. `coder` must be in the `docker` group (`sudo gpasswd -a coder docker`).
 
 The script blocks until VS Code exits. Run it in the background (`&`) if you want your shell back.
 
