@@ -1,12 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# vscode-isolate.sh — Grant the "coder" user access to a project directory
-# and launch VS Code as "coder".
+# vscode-isolate.sh — Grant the "coder" user access to one or more project
+# directories and launch VS Code as "coder" on the first one.
 #
 # Usage:
-#   ./vscode-isolate.sh /path/to/project
-#   ./vscode-isolate.sh --pat /path/to/project    (also configure git PAT for the repo)
+#   ./vscode-isolate.sh /path/to/project [/another/path ...]
+#   ./vscode-isolate.sh --pat /path/to/project [/another/path ...]    (also configure git PAT for the first repo)
+#
+# Multiple paths get ACL permissions granted, but VS Code only opens the first.
 #
 # ISOLATION NOTE: running the agent as a separate user gives *reduced-privilege*
 # separation, NOT a hard security boundary. Known residual holes (X11 session):
@@ -43,7 +45,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -*)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--pat] [--rooted] /path/to/project"
+            echo "Usage: $0 [--pat] [--rooted] /path/to/project [/another/path ...]"
             exit 1
             ;;
         *)
@@ -52,12 +54,25 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 [--pat] [--rooted] /path/to/project"
+if [[ $# -eq 0 ]]; then
+    echo "Usage: $0 [--pat] [--rooted] /path/to/project [/another/path ...]"
     exit 1
 fi
 
-PROJECT_DIR="$1"
+# Collect all remaining positional arguments as project directories
+PROJECT_DIRS=("$@")
+
+# Resolve and validate all paths upfront
+for i in "${!PROJECT_DIRS[@]}"; do
+    if [[ ! -d "${PROJECT_DIRS[$i]}" ]]; then
+        echo "Error: '${PROJECT_DIRS[$i]}' is not a directory"
+        exit 1
+    fi
+    PROJECT_DIRS[$i]="$(realpath "${PROJECT_DIRS[$i]}")"
+done
+
+# The first path is what VS Code will open; all paths get ACLs
+FIRST_DIR="${PROJECT_DIRS[0]}"
 
 if ! id -u "$CODER_USER" >/dev/null 2>&1; then
     echo "Error: user '$CODER_USER' does not exist"
@@ -84,21 +99,13 @@ elif id -nG "$CODER_USER" | grep -qw docker; then
     exit 1
 fi
 
-if [[ ! -d "$PROJECT_DIR" ]]; then
-    echo "Error: '$PROJECT_DIR' is not a directory"
-    exit 1
-fi
-
-# Resolve to absolute path
-PROJECT_DIR="$(realpath "$PROJECT_DIR")"
-
 # --- PAT setup ---
 if [[ "$SETUP_PAT" == true ]]; then
-    # Detect the git remote URL from the project
-    REMOTE_URL="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
+    # Detect the git remote URL from the first project
+    REMOTE_URL="$(git -C "$FIRST_DIR" remote get-url origin 2>/dev/null || true)"
 
     if [[ -z "$REMOTE_URL" ]]; then
-        echo "Error: No git remote 'origin' found in $PROJECT_DIR"
+        echo "Error: No git remote 'origin' found in $FIRST_DIR"
         exit 1
     fi
 
@@ -143,19 +150,21 @@ if [[ "$SETUP_PAT" == true ]]; then
 fi
 
 # --- ACL setup ---
-echo "==> Granting $CODER_USER full access to $PROJECT_DIR ..."
+for DIR in "${PROJECT_DIRS[@]}"; do
+    echo "==> Granting $CODER_USER full access to $DIR ..."
 
-# Grant read/write/execute (capital X = execute only on dirs and already-executable files)
-# in a single recursive pass:
-#  - access ACL for coder
-#  - default ACL so new files/dirs created by either user inherit both users' access
-sudo setfacl -R \
-    -m  u:"$CODER_USER":rwX \
-    -dm u:"$CODER_USER":rwX \
-    -dm u:"$CALLING_USER":rwX \
-    "$PROJECT_DIR"
+    # Grant read/write/execute (capital X = execute only on dirs and already-executable files)
+    # in a single recursive pass:
+    #  - access ACL for coder
+    #  - default ACL so new files/dirs created by either user inherit both users' access
+    sudo setfacl -R \
+        -m  u:"$CODER_USER":rwX \
+        -dm u:"$CODER_USER":rwX \
+        -dm u:"$CALLING_USER":rwX \
+        "$DIR"
+done
 
-echo "    Done. ACLs set."
+echo "    Done. ACLs set on ${#PROJECT_DIRS[@]} director$(if [[ ${#PROJECT_DIRS[@]} -ne 1 ]]; then echo "ies"; else echo "y"; fi)."
 
 # Allow coder to use the current X display (skip on Wayland-only sessions)
 if [[ -n "${DISPLAY:-}" ]] && command -v xhost >/dev/null; then
@@ -200,12 +209,14 @@ fi
 CODER_PATH="$(sudo -u "$CODER_USER" -i bash -lc 'echo "$PATH"')"
 
 # Allow coder to work in repos owned by other users (skip if already listed)
-if ! sudo -u "$CODER_USER" git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$PROJECT_DIR"; then
-    sudo -u "$CODER_USER" git config --global --add safe.directory "$PROJECT_DIR"
-fi
+for DIR in "${PROJECT_DIRS[@]}"; do
+    if ! sudo -u "$CODER_USER" git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$DIR"; then
+        sudo -u "$CODER_USER" git config --global --add safe.directory "$DIR"
+    fi
+done
 
 # Launch VS Code as coder
-echo "==> Launching VS Code as $CODER_USER on $PROJECT_DIR ..."
+echo "==> Launching VS Code as $CODER_USER on $FIRST_DIR ..."
 
 # Build the DOCKER_HOST assignment: rootless points at coder's own socket;
 # rooted omits it so Docker falls back to /var/run/docker.sock.
@@ -221,4 +232,4 @@ sudo -u "$CODER_USER" \
     XDG_RUNTIME_DIR="$CODER_RUNTIME" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=$CODER_RUNTIME/bus" \
     "${DOCKER_HOST_ENV[@]}" \
-    code --no-sandbox --password-store="basic" "$PROJECT_DIR"
+    code --no-sandbox --password-store="basic" "$FIRST_DIR"

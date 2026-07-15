@@ -2,7 +2,7 @@
 
 Run VS Code — and any coding agent inside it — as a **separate, lower-privilege Linux user**, while still working on your own project files.
 
-`vscode-isolate` is a small Bash wrapper that grants a dedicated `coder` user access to one project directory (via ACLs), lets it use your desktop session, and launches VS Code as that user. It's aimed at running AI coding agents in **auto/YOLO mode**: the agent can freely edit the project and run commands, but it operates as `coder`, not as you.
+`vscode-isolate` is a small Bash wrapper that grants a dedicated `coder` user access to one or more project directories (via ACLs), lets it use your desktop session, and launches VS Code as that user on the first directory. It's aimed at running AI coding agents in **auto/YOLO mode**: the agent can freely edit the project and run commands, but it operates as `coder`, not as you.
 
 > [!IMPORTANT]
 > This is **reduced-privilege separation, not a hard security boundary.** A determined process running as `coder` on the same machine still has meaningful reach (see [Security model](#security-model)). Treat it as a seatbelt, not a vault. If you need real containment, use a VM or a rootless container — not this.
@@ -11,9 +11,9 @@ Run VS Code — and any coding agent inside it — as a **separate, lower-privil
 
 ## What it does
 
-Given a project directory, the script:
+Given one or more project directories, the script:
 
-1. **Shares the files** — grants `coder` recursive `rwX` ACLs on the project, plus *default* ACLs so files created later by either user stay mutually accessible.
+1. **Shares the files** — grants `coder` recursive `rwX` ACLs on every specified directory, plus *default* ACLs so files created later by either user stay mutually accessible.
 2. **Shares the display** — lets `coder` open windows on your current X session (`xhost`).
 3. **Prepares the environment** — ensures `coder`'s `XDG_RUNTIME_DIR`, VS Code config dirs, git `safe.directory`, and login `PATH` are set up.
 4. **Points Docker at a rootless daemon** — so containers the agent starts run unprivileged (see [Docker, rootless](#2-optional-docker-rootless)).
@@ -69,11 +69,15 @@ The wrapper then sets `DOCKER_HOST` inside VS Code to `coder`'s rootless socket,
 # Grant access + launch VS Code as coder on a project
 ./vscode-isolate.sh /path/to/project
 
-# Also configure a GitHub PAT for the project's origin remote
-./vscode-isolate.sh --pat /path/to/project
+# Grant access to multiple directories (e.g. monorepo with shared libs)
+# VS Code opens only the first path; ACLs are set on all of them
+./vscode-isolate.sh /path/to/project /path/to/shared-lib /path/to/config
+
+# Also configure a GitHub PAT for the first project's origin remote
+./vscode-isolate.sh --pat /path/to/project [/another/path ...]
 
 # Use rootful (host) Docker instead of rootless (opt-in escape hatch)
-./vscode-isolate.sh --rooted /path/to/project
+./vscode-isolate.sh --rooted /path/to/project [/another/path ...]
 ```
 
 **`--rooted`**: Skips rootless Docker enforcement and lets `coder` use the host's rootful Docker daemon (`/var/run/docker.sock`). Use this when a project breaks under rootless Docker (e.g., needs privileged containers, certain volume mounts, or host networking). **Trade-off**: containers can escape to host root — isolation is significantly degraded. `coder` must be in the `docker` group (`sudo gpasswd -a coder docker`).
