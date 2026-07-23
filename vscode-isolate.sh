@@ -7,6 +7,8 @@ set -euo pipefail
 # Usage:
 #   ./vscode-isolate.sh /path/to/project [/another/path ...]
 #   ./vscode-isolate.sh --pat /path/to/project [/another/path ...]    (also configure git PAT for the first repo)
+#   ./vscode-isolate.sh --max-memory 16384 /path/to/project          (raise VS Code window memory to 16 GB; default 8192 MB)
+#   ./vscode-isolate.sh --ls-memory 6144 /path/to/project            (raise TS language-server heap to 6 GB; default 4096 MB)
 #
 # Multiple paths get ACL permissions granted, but VS Code only opens the first.
 #
@@ -31,6 +33,8 @@ CODER_CREDS="/home/$CODER_USER/.git-credentials"
 CALLING_USER="${SUDO_USER:-$USER}"
 SETUP_PAT=false
 ROOTED_DOCKER=false
+MAX_MEMORY_MB=8192
+LS_MEMORY_MB=4096
 
 # Parse options
 while [[ $# -gt 0 ]]; do
@@ -43,9 +47,25 @@ while [[ $# -gt 0 ]]; do
             ROOTED_DOCKER=true
             shift
             ;;
+        --max-memory)
+            if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+                echo "Error: --max-memory requires a size in MB (e.g. --max-memory 16384)"
+                exit 1
+            fi
+            MAX_MEMORY_MB="$2"
+            shift 2
+            ;;
+        --ls-memory)
+            if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+                echo "Error: --ls-memory requires a size in MB (e.g. --ls-memory 6144)"
+                exit 1
+            fi
+            LS_MEMORY_MB="$2"
+            shift 2
+            ;;
         -*)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--pat] [--rooted] /path/to/project [/another/path ...]"
+            echo "Usage: $0 [--pat] [--rooted] [--max-memory MB] [--ls-memory MB] /path/to/project [/another/path ...]"
             exit 1
             ;;
         *)
@@ -55,7 +75,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 [--pat] [--rooted] /path/to/project [/another/path ...]"
+    echo "Usage: $0 [--pat] [--rooted] [--max-memory MB] [--ls-memory MB] /path/to/project [/another/path ...]"
     exit 1
 fi
 
@@ -187,8 +207,46 @@ if [[ ! -d "$CODER_RUNTIME" ]]; then
 fi
 
 # Create VS Code config/extensions dirs
-sudo -u "$CODER_USER" mkdir -p "$CODER_HOME/.config/Code"
+sudo -u "$CODER_USER" mkdir -p "$CODER_HOME/.config/Code/User"
 sudo -u "$CODER_USER" mkdir -p "$CODER_HOME/.vscode/extensions"
+
+# --- Language-server / extension-host memory ---
+# The extension host is a Node process whose heap auto-sizes to the host RAM, so
+# the practical lever VS Code exposes is the TypeScript language server's heap
+# (typescript.tsserver.maxTsServerMemory, default 3072 MB). Merge the key into
+# coder's user settings without disturbing anything already there. If the file
+# has comments / trailing commas (valid JSONC but not JSON), leave it untouched
+# and tell the user to add the key by hand rather than risk clobbering it.
+CODER_SETTINGS="$CODER_HOME/.config/Code/User/settings.json"
+echo "==> Setting TS language-server memory to ${LS_MEMORY_MB} MB ..."
+if ! sudo -u "$CODER_USER" LS_MEMORY_MB="$LS_MEMORY_MB" python3 - "$CODER_SETTINGS" <<'PY'
+import json, os, sys
+
+path = sys.argv[1]
+mem = int(os.environ["LS_MEMORY_MB"])
+try:
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("top-level value is not a JSON object")
+except FileNotFoundError:
+    data = {}
+except Exception as e:                       # comments, trailing commas, etc.
+    sys.stderr.write("could not parse settings.json: %s\n" % e)
+    sys.exit(3)
+
+data["typescript.tsserver.maxTsServerMemory"] = mem
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=4)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+then
+    echo "    Warning: left settings.json untouched (not plain JSON)."
+    echo "    Add this to $CODER_SETTINGS manually:"
+    echo "      \"typescript.tsserver.maxTsServerMemory\": ${LS_MEMORY_MB}"
+fi
 
 # Ensure coder's rootless Docker daemon is running, and point the sandbox at it
 # (its own unprivileged socket) rather than the host's root-owned socket.
@@ -232,4 +290,4 @@ sudo -u "$CODER_USER" \
     XDG_RUNTIME_DIR="$CODER_RUNTIME" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=$CODER_RUNTIME/bus" \
     "${DOCKER_HOST_ENV[@]}" \
-    code --no-sandbox --password-store="basic" "$FIRST_DIR"
+    code --no-sandbox --password-store="basic" --max-memory="$MAX_MEMORY_MB" "$FIRST_DIR"
